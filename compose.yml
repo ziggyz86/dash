@@ -1,0 +1,162 @@
+version: '3.8'
+
+services:
+
+  heimdall:
+    image: lscr.io/linuxserver/heimdall:latest
+    container_name: heimdall
+    environment:
+        PUID: ${PUID}
+        PGID: ${PGID}
+        TZ: ${TZ}
+    volumes:
+      - ./docker/heimdall:/config
+    ports:
+      - 80:80
+      - 443:443
+    restart: unless-stopped
+
+
+  reverse-proxy:
+      # The official v2 Traefik docker image
+      image: traefik:v2.6
+      container_name: traefik
+      # Enables the web UI and tells Traefik to listen to docker
+      command:
+        - "--api.insecure=true"
+        - "--providers.docker"
+        - "--entryPoints.http.address=:80"
+        - "--entryPoints.websecure.address=:443"
+        - --log=true
+        - --log.level=WARN # (Default: error) DEBUG, INFO, WARN, ERROR, FATAL, PANIC
+        - --accessLog=true
+        - --accessLog.filePath=/traefik.log
+        # Add dns-cloudflare as default certresolver for all services. Also enables TLS and no need to specify on individual services
+        - "--entrypoints.websecure.http.tls.certresolver=matrixresolver"
+        - "--entrypoints.websecure.http.tls.domains[0].main=${DOMAIN}"
+        - "--entrypoints.websecure.http.tls.domains[0].sans=*.${DOMAIN}"
+        - "--certificatesresolvers.matrixresolver.acme.dnschallenge=true"
+        - "--certificatesresolvers.matrixresolver.acme.dnschallenge.provider=cloudflare"
+        - "--certificatesResolvers.matrixresolver.acme.dnsChallenge.resolvers=1.1.1.1:53,1.0.0.1:53"
+        - "--certificatesResolvers.matrixresolver.acme.dnsChallenge.delayBeforeCheck=90" # To delay DNS check and reduce LE hitrate
+        - "--certificatesresolvers.matrixresolver.acme.email=it@${DOMAIN}"
+        - "--certificatesresolvers.matrixresolver.acme.storage=/acme.json"
+      labels:
+        # HTTP-to-HTTPS Redirect
+        - "traefik.http.routers.http-catchall.entrypoints=http"
+        - "traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)"
+        - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+        - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      networks:
+        - bridge
+        - proxy
+      restart: always
+      ports:
+        # The HTTPS port
+        - "443:443"
+        # The Web UI (enabled by --api.insecure=true)
+        - "8080:8080"
+      environment:
+        - CF_API_EMAIL=it@${DOMAIN}
+        - CF_API_KEY=${CLOUDFLARE_API_KEY}
+      volumes:
+        # So that Traefik can listen to the Docker events
+        - /var/run/docker.sock:/var/run/docker.sock
+        - ./docker/traefik2/rules:/rules # file provider directory
+        - ./docker/traefik2/acme/acme.json:/acme.json # cert location - you must touch this file and change permissions to 600
+        - ./docker/traefik2/traefik.log:/traefik.log # for fail2ban - make sure to touch file before starting container
+
+  uptime:
+      image: louislam/uptime-kuma
+      container_name: uptimekuma
+      environment:
+        - PUID=${PUID}
+        - PGID=${PGID}
+        - TZ=${TZ}
+      volumes:
+        - ${USERDIR}/docker/uptimekuma:/app/data
+      networks:
+        - t2_proxy
+      security_opt:
+        - no-new-privileges:true
+      restart: unless-stopped
+      labels:
+        - "traefik.enable=true"
+        ## HTTP Routers Auth Bypass
+        - "traefik.http.routers.uptime-rtr-bypass.entrypoints=https"
+        - "traefik.http.routers.uptime-rtr-bypass.rule=Host(`uptime.$DOMAINNAME`)"
+        - "traefik.http.routers.uptime-rtr-bypass.priority=100"
+        ## HTTP Routers Auth
+        - "traefik.http.routers.uptime-rtr.entrypoints=https"
+        - "traefik.http.routers.uptime-rtr.rule=Host(`uptime.$DOMAINNAME`)"
+        - "traefik.http.routers.uptime-rtr.priority=99"
+        ## HTTP Services
+        - "traefik.http.routers.uptime-rtr.service=uptime-svc"
+        - "traefik.http.routers.uptime-rtr-bypass.service=uptime-svc"
+        - "traefik.http.services.uptime-svc.loadbalancer.server.port=3001"
+
+  singalcli:
+    image: bbernhard/signal-cli-rest-api:latest
+    container_name: signalcli
+    restart: unless-stopped
+    networks:
+      - t2_proxy
+    environment:
+      - MODE=normal #supported modes: json-rpc, native, normal
+      #- AUTO_RECEIVE_SCHEDULE=0 22 * * * #enable this parameter on demand (see description below)
+    volumes:
+      - "./docker/signal-cli-config:/home/.local/share/signal-cli" #map "signal-cli-config" folder on host system into docker container. the folder contains the password and cryptographic keys when a new number is registered
+    labels:
+      - "traefik.enable=true"
+      ## HTTP Routers Auth Bypass
+      - "traefik.http.routers.signal-rtr-bypass.entrypoints=https"
+      - "traefik.http.routers.signal-rtr-bypass.rule=Host(`signal.$DOMAINNAME`)"
+      - "traefik.http.routers.signal-rtr-bypass.priority=100"
+      ## HTTP Routers Auth
+      - "traefik.http.routers.signal-rtr.entrypoints=https"
+      - "traefik.http.routers.signal-rtr.rule=Host(`signal.$DOMAINNAME`)"
+      - "traefik.http.routers.signal-rtr.priority=99"
+      ## HTTP Services
+      - "traefik.http.routers.signal-rtr.service=signal-svc"
+      - "traefik.http.routers.signal-rtr-bypass.service=signal-svc"
+      - "traefik.http.services.signal-svc.loadbalancer.server.port=8080"
+
+  homeassistant:
+    container_name: homeassistant
+    image: "ghcr.io/home-assistant/home-assistant:stable"
+    volumes:
+      - ./docker/homeassistant:/config
+      - /etc/localtime:/etc/localtime:ro
+    devices:
+      # - /dev/serial/by-id/usb-Silicon_Labs_HubZ_Smart_Home_Controller_715001B8-if01-port0:/dev/serial/by-id/usb-Silicon_Labs_HubZ_Smart_Home_Controller_715001B8-if01-port0
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - DISABLE_JEMALLOC= true
+    restart: unless-stopped
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_BIND_SERVICE
+      - SYS_ADMIN
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8123"]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.homeassistant.entrypoints=https"
+      - "traefik.http.routers.homeassistant.rule=Host(`homeassistant.$DOMAINNAME`)"
+      - "traefik.http.routers.homeassistant.tls=true"
+      - "traefik.http.routers.homeassistant.tls.certresolver=dns-cloudflare"
+      - "traefik.http.services.homeassistant.loadbalancer.server.port=8123"
+
+networks:
+  bridge:
+    driver: bridge
+  proxy:
+    driver: bridge
